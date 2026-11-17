@@ -1,0 +1,4 @@
+all:
+  hosts:
+    mainframe:
+      ansible_connection: local

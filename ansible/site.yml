@@ -1,0 +1,172 @@
+---
+- name: Install k3s on the mainframe
+  hosts: mainframe
+  become: true
+  gather_facts: true
+  vars:
+    k3s_version: v1.37.2+k3s1
+    k3s_token: "{{ lookup('ansible.builtin.env', 'K3S_TOKEN') }}"
+    k3s_expected_hostname: mainframe
+    k3s_expected_node_ip: 10.88.111.24
+    k3s_api_lan_cidr: 10.88.111.0/24
+    k3s_tailscale_ipv4_cidr: 100.64.0.0/10
+    k3s_tailscale_ipv6_cidr: fd7a:115c:a1e0::/48
+  tasks:
+    - name: Validate the target host and Infisical secret
+      ansible.builtin.assert:
+        that:
+          - ansible_distribution == "Ubuntu"
+          - ansible_distribution_major_version == "24"
+          - ansible_architecture == "x86_64"
+          - ansible_hostname == k3s_expected_hostname
+          - k3s_expected_node_ip in ansible_all_ipv4_addresses
+          - k3s_token | length > 0
+        fail_msg: >-
+          This playbook requires the mainframe host (hostname mainframe,
+          address 10.88.111.24) running Ubuntu 24 on x86_64, and a non-empty
+          K3S_TOKEN supplied by Infisical.
+        quiet: true
+
+    - name: Install k3s host dependencies
+      ansible.builtin.apt:
+        name:
+          - ca-certificates
+          - curl
+          - iproute2
+          - iptables
+          - ufw
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Check the UFW firewall state
+      ansible.builtin.command:
+        argv:
+          - ufw
+          - status
+      register: ufw_status
+      changed_when: false
+
+    - name: Require UFW to be active before installing k3s
+      ansible.builtin.assert:
+        that:
+          - "'Status: active' in ufw_status.stdout"
+        fail_msg: >-
+          UFW must already be active so this playbook can restrict k3s API
+          access to the LAN and Tailscale without changing the host's broader
+          firewall policy.
+        quiet: true
+
+    - name: Allow the Kubernetes API from the LAN
+      community.general.ufw:
+        rule: allow
+        direction: in
+        proto: tcp
+        port: "6443"
+        src: "{{ k3s_api_lan_cidr }}"
+        insert: 0
+        insert_relative_to: first-ipv4
+        comment: k3s API from LAN
+
+    - name: Allow the Kubernetes API from Tailscale over IPv4
+      community.general.ufw:
+        rule: allow
+        direction: in
+        proto: tcp
+        port: "6443"
+        src: "{{ k3s_tailscale_ipv4_cidr }}"
+        insert: 1
+        insert_relative_to: first-ipv4
+        comment: k3s API from Tailscale IPv4
+
+    - name: Deny other IPv4 Kubernetes API access
+      community.general.ufw:
+        rule: deny
+        direction: in
+        proto: tcp
+        port: "6443"
+        src: 0.0.0.0/0
+        insert: 2
+        insert_relative_to: first-ipv4
+        comment: restrict k3s API IPv4 to LAN and Tailscale
+
+    - name: Allow the Kubernetes API from Tailscale over IPv6
+      community.general.ufw:
+        rule: allow
+        direction: in
+        proto: tcp
+        port: "6443"
+        src: "{{ k3s_tailscale_ipv6_cidr }}"
+        insert: 0
+        insert_relative_to: first-ipv6
+        comment: k3s API from Tailscale IPv6
+
+    - name: Deny other IPv6 Kubernetes API access
+      community.general.ufw:
+        rule: deny
+        direction: in
+        proto: tcp
+        port: "6443"
+        src: "::/0"
+        insert: 1
+        insert_relative_to: first-ipv6
+        comment: restrict k3s API IPv6 to Tailscale
+
+    - name: Ensure the installer directory exists
+      ansible.builtin.file:
+        path: /usr/local/src
+        state: directory
+        mode: "0755"
+
+    - name: Download the official k3s installer
+      ansible.builtin.get_url:
+        url: https://get.k3s.io
+        dest: /usr/local/src/k3s-install.sh
+        mode: "0755"
+        validate_certs: true
+
+    - name: Check the installed k3s version
+      ansible.builtin.command:
+        argv:
+          - /usr/local/bin/k3s
+          - --version
+      register: installed_k3s
+      changed_when: false
+      failed_when: false
+
+    - name: Parse the installed k3s version
+      ansible.builtin.set_fact:
+        installed_k3s_version: >-
+          {{ installed_k3s.stdout.split()[2]
+             if installed_k3s.rc == 0 and (installed_k3s.stdout.split() | length) >= 3
+             else '' }}
+
+    - name: Install or upgrade k3s
+      ansible.builtin.command:
+        argv:
+          - /usr/local/src/k3s-install.sh
+      environment:
+        INSTALL_K3S_EXEC: server
+        INSTALL_K3S_VERSION: "{{ k3s_version }}"
+        K3S_TOKEN: "{{ k3s_token }}"
+      no_log: true
+      when: installed_k3s_version != k3s_version
+
+    - name: Ensure the k3s service is enabled and running
+      ansible.builtin.systemd_service:
+        name: k3s
+        enabled: true
+        state: started
+
+    - name: Wait for the Kubernetes API to report the node
+      ansible.builtin.command:
+        argv:
+          - /usr/local/bin/k3s
+          - kubectl
+          - get
+          - nodes
+      register: k3s_nodes
+      changed_when: false
+      retries: 12
+      delay: 5
+      until: k3s_nodes.rc == 0
