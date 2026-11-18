@@ -25,7 +25,33 @@ If using a machine identity instead, configure its authentication through your n
 
 In the Infisical project, create a strong `K3S_TOKEN` secret in the environment and path you intend to use. The playbook requires this secret and does not print it. Keep the token stable: it is used when initializing the server and is also needed by future agents joining this cluster.
 
-Before deploying, configure and enable UFW with the inbound rules needed by the mainframe's existing services and SSH access. The playbook requires UFW to be active and allows TCP port 6443 from the LAN (`10.88.111.0/24`) and Tailscale's IPv4 (`100.64.0.0/10`) and IPv6 (`fd7a:115c:a1e0::/48`) ranges. It denies the API port from other IPv4 and IPv6 sources and does not change UFW's default inbound policy. The VPN Pi's default Tailscale subnet-router SNAT makes routed traffic appear from its LAN address, which is already allowed.
+### Set up UFW
+
+Check the current firewall rules and listening services so you can keep the ports used by existing services open:
+
+```bash
+sudo ufw status numbered
+sudo ss -tulpn
+sudo ufw app list
+```
+
+If UFW is already active, add any missing allow rules and preserve the rules those services need. For example, `sudo ufw allow OpenSSH` allows standard SSH, and `sudo ufw allow 443/tcp` allows HTTPS; use the actual port and protocol for each service. If SSH uses a nonstandard port, allow that port before proceeding.
+
+For a new UFW setup, add the required service rules before enabling the firewall. This example uses standard SSH; add rules for any other services the mainframe provides:
+
+```bash
+sudo ufw allow OpenSSH
+# Examples: uncomment only if these services run on this host.
+# sudo ufw allow 80/tcp
+# sudo ufw allow 443/tcp
+# For another service, use: sudo ufw allow PORT/PROTOCOL
+sudo ufw default deny incoming
+sudo ufw default allow outgoing
+sudo ufw enable
+sudo ufw status verbose
+```
+
+Check that IPv6 filtering is enabled with `grep '^IPV6=' /etc/default/ufw`. If it says `IPV6=no`, set it to `yes` before enabling UFW; if UFW is already active, reload it with `sudo ufw reload`. The playbook requires UFW to be active, then adds rules allowing TCP port 6443 from the LAN (`10.88.111.0/24`) and Tailscale's IPv4 (`100.64.0.0/10`) and IPv6 (`fd7a:115c:a1e0::/48`) ranges. It denies that API port from other IPv4 and IPv6 sources and does not change UFW's default inbound policy. The VPN Pi's default Tailscale subnet-router SNAT makes routed traffic appear from its LAN address, which is already allowed.
 
 ## Deploy
 
