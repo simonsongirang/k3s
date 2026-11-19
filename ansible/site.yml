@@ -1,16 +1,23 @@
 ---
-- name: Install k3s on the mainframe
+- name: Join the mainframe to the existing k3s cluster as a worker
   hosts: mainframe
   become: true
   gather_facts: true
   vars:
-    k3s_version: v1.37.2+k3s1
+    k3s_version: "{{ lookup('ansible.builtin.env', 'K3S_VERSION') }}"
+    k3s_server_url: "{{ lookup('ansible.builtin.env', 'K3S_URL') }}"
     k3s_token: "{{ lookup('ansible.builtin.env', 'K3S_TOKEN') }}"
     k3s_expected_hostname: mainframe
     k3s_expected_node_ip: 10.88.111.24
     k3s_api_lan_cidr: 10.88.111.0/24
     k3s_tailscale_ipv4_cidr: 100.64.0.0/10
     k3s_tailscale_ipv6_cidr: fd7a:115c:a1e0::/48
+    k3s_pod_cidr: 10.42.0.0/16
+    k3s_service_cidr: 10.43.0.0/16
+    k3s_cluster_peer_cidrs:
+      - "{{ k3s_api_lan_cidr }}"
+      - "{{ k3s_tailscale_ipv4_cidr }}"
+      - "{{ k3s_tailscale_ipv6_cidr }}"
   tasks:
     - name: Validate the target host and Infisical secret
       ansible.builtin.assert:
@@ -20,12 +27,34 @@
           - ansible_architecture == "x86_64"
           - ansible_hostname == k3s_expected_hostname
           - k3s_expected_node_ip in ansible_all_ipv4_addresses
+          - k3s_server_url is match('^https://')
+          - k3s_version | length > 0
           - k3s_token | length > 0
         fail_msg: >-
           This playbook requires the mainframe host (hostname mainframe,
-          address 10.88.111.24) running Ubuntu 24 on x86_64, and a non-empty
-          K3S_TOKEN supplied by Infisical.
+          address 10.88.111.24) running Ubuntu 24 on x86_64. Infisical must
+          provide K3S_URL, K3S_TOKEN, and K3S_VERSION for the existing cluster.
         quiet: true
+
+    - name: Check for an existing standalone k3s server unit
+      ansible.builtin.stat:
+        path: /etc/systemd/system/k3s.service
+      register: existing_k3s_server_unit
+
+    - name: Refuse to convert a standalone server into a worker automatically
+      ansible.builtin.assert:
+        that:
+          - not existing_k3s_server_unit.stat.exists
+        fail_msg: >-
+          A standalone k3s server unit already exists on this host. This playbook
+          will not remove its cluster state or convert it to an agent automatically.
+          Migrate or clean up that installation deliberately before retrying.
+        quiet: true
+
+    - name: Check for an existing k3s agent unit
+      ansible.builtin.stat:
+        path: /etc/systemd/system/k3s-agent.service
+      register: existing_k3s_agent_unit
 
     - name: Install k3s host dependencies
       ansible.builtin.apt:
@@ -44,6 +73,7 @@
         argv:
           - ufw
           - status
+          - verbose
       register: ufw_status
       changed_when: false
 
@@ -51,66 +81,97 @@
       ansible.builtin.assert:
         that:
           - "'Status: active' in ufw_status.stdout"
+          - "'Default: deny (incoming)' in ufw_status.stdout"
+          - "'allow (outgoing)' in ufw_status.stdout"
         fail_msg: >-
-          UFW must already be active so this playbook can restrict k3s API
-          access to the LAN and Tailscale without changing the host's broader
-          firewall policy.
+          UFW must already be active with default-deny incoming and
+          allow-outgoing policies. Configure those policies while preserving
+          the rules required by the mainframe's other services and SSH.
         quiet: true
 
-    - name: Allow the Kubernetes API from the LAN
+    - name: Check that UFW IPv6 filtering is enabled
+      ansible.builtin.command:
+        argv:
+          - grep
+          - -Eq
+          - ^IPV6=yes$
+          - /etc/default/ufw
+      register: ufw_ipv6_setting
+      changed_when: false
+      failed_when: false
+
+    - name: Require UFW IPv6 filtering for Tailscale
+      ansible.builtin.assert:
+        that:
+          - ufw_ipv6_setting.rc == 0
+        fail_msg: >-
+          Set IPV6=yes in /etc/default/ufw and reload UFW before deploying;
+          the Tailscale IPv6 firewall rules need IPv6 filtering enabled.
+        quiet: true
+
+    - name: Allow traffic from the cluster pod network
+      community.general.ufw:
+        rule: allow
+        direction: in
+        src: "{{ k3s_pod_cidr }}"
+        comment: k3s pod network
+
+    - name: Allow traffic from the cluster service network
+      community.general.ufw:
+        rule: allow
+        direction: in
+        src: "{{ k3s_service_cidr }}"
+        comment: k3s service network
+
+    - name: Allow Flannel VXLAN from cluster peer networks
+      community.general.ufw:
+        rule: allow
+        direction: in
+        proto: udp
+        port: "8472"
+        src: "{{ item }}"
+        comment: k3s Flannel VXLAN from cluster peers
+      loop: "{{ k3s_cluster_peer_cidrs }}"
+
+    - name: Allow metrics-server traffic from cluster peer networks
       community.general.ufw:
         rule: allow
         direction: in
         proto: tcp
-        port: "6443"
-        src: "{{ k3s_api_lan_cidr }}"
-        insert: 0
-        insert_relative_to: first-ipv4
-        comment: k3s API from LAN
+        port: "10250"
+        src: "{{ item }}"
+        comment: k3s metrics-server from cluster peers
+      loop: "{{ k3s_cluster_peer_cidrs }}"
 
-    - name: Allow the Kubernetes API from Tailscale over IPv4
+    - name: Allow ingress ports from LAN and Tailscale
       community.general.ufw:
         rule: allow
         direction: in
         proto: tcp
-        port: "6443"
-        src: "{{ k3s_tailscale_ipv4_cidr }}"
-        insert: 1
-        insert_relative_to: first-ipv4
-        comment: k3s API from Tailscale IPv4
+        port: "{{ item.1 }}"
+        src: "{{ item.0 }}"
+        comment: k3s ingress from LAN and Tailscale
+      loop: "{{ k3s_cluster_peer_cidrs | product([80, 443]) | list }}"
 
-    - name: Deny other IPv4 Kubernetes API access
-      community.general.ufw:
-        rule: deny
-        direction: in
-        proto: tcp
-        port: "6443"
-        src: 0.0.0.0/0
-        insert: 2
-        insert_relative_to: first-ipv4
-        comment: restrict k3s API IPv4 to LAN and Tailscale
+    - name: Ensure the k3s agent configuration directory exists
+      ansible.builtin.file:
+        path: /etc/rancher/k3s
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
 
-    - name: Allow the Kubernetes API from Tailscale over IPv6
-      community.general.ufw:
-        rule: allow
-        direction: in
-        proto: tcp
-        port: "6443"
-        src: "{{ k3s_tailscale_ipv6_cidr }}"
-        insert: 0
-        insert_relative_to: first-ipv6
-        comment: k3s API from Tailscale IPv6
-
-    - name: Deny other IPv6 Kubernetes API access
-      community.general.ufw:
-        rule: deny
-        direction: in
-        proto: tcp
-        port: "6443"
-        src: "::/0"
-        insert: 1
-        insert_relative_to: first-ipv6
-        comment: restrict k3s API IPv6 to Tailscale
+    - name: Configure the k3s agent to join the existing cluster
+      ansible.builtin.copy:
+        dest: /etc/rancher/k3s/config.yaml
+        owner: root
+        group: root
+        mode: "0600"
+        content: |
+          server: {{ k3s_server_url | to_json }}
+          token: {{ k3s_token | to_json }}
+      no_log: true
+      notify: Restart k3s agent
 
     - name: Ensure the installer directory exists
       ansible.builtin.file:
@@ -146,27 +207,31 @@
         argv:
           - /usr/local/src/k3s-install.sh
       environment:
-        INSTALL_K3S_EXEC: server
+        INSTALL_K3S_EXEC: agent
         INSTALL_K3S_VERSION: "{{ k3s_version }}"
-        K3S_TOKEN: "{{ k3s_token }}"
       no_log: true
-      when: installed_k3s_version != k3s_version
+      when: not existing_k3s_agent_unit.stat.exists or installed_k3s_version != k3s_version
 
-    - name: Ensure the k3s service is enabled and running
+    - name: Ensure the k3s agent service is enabled and running
       ansible.builtin.systemd_service:
-        name: k3s
+        name: k3s-agent
         enabled: true
         state: started
 
-    - name: Wait for the Kubernetes API to report the node
+    - name: Wait for the k3s agent service to become active
       ansible.builtin.command:
         argv:
-          - /usr/local/bin/k3s
-          - kubectl
-          - get
-          - nodes
-      register: k3s_nodes
+          - systemctl
+          - is-active
+          - k3s-agent
+      register: k3s_agent_status
       changed_when: false
       retries: 12
       delay: 5
-      until: k3s_nodes.rc == 0
+      until: k3s_agent_status.rc == 0
+
+  handlers:
+    - name: Restart k3s agent
+      ansible.builtin.systemd_service:
+        name: k3s-agent
+        state: restarted
